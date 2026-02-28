@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>不動産収支計算機</title>
+<!-- PWA meta tags -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="収支計算機">
+<meta name="theme-color" content="#2563EB">
+<meta name="description" content="不動産投資の案件別収支計算機">
+<!-- App icon -->
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="icon" type="image/png" href="icon-192.png">
+<!-- Manifest -->
+<link rel="manifest" href="manifest.json">
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Noto+Sans+JP:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body, #root { height: 100%; }
+body { font-family: 'DM Sans', 'Noto Sans JP', sans-serif; -webkit-tap-highlight-color: transparent; }
+input, textarea, button { font-family: inherit; }
+/* Safe area for notched iPhones */
+@supports (padding: env(safe-area-inset-top)) {
+  body { padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); padding-left: env(safe-area-inset-left); padding-right: env(safe-area-inset-right); }
+}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+// ─── Math expression parser ───
+function tokenize(expr) {
+  const tokens = [];
+  let i = 0;
+  while (i < expr.length) {
+    if (expr[i] === " ") { i++; continue; }
+    if ("0123456789.".includes(expr[i])) {
+      let num = "";
+      while (i < expr.length && "0123456789.".includes(expr[i])) { num += expr[i++]; }
+      tokens.push({ type: "num", value: parseFloat(num) });
+    } else if ("+-*/".includes(expr[i])) {
+      tokens.push({ type: "op", value: expr[i++] });
+    } else if (expr[i] === "(") {
+      tokens.push({ type: "lparen" }); i++;
+    } else if (expr[i] === ")") {
+      tokens.push({ type: "rparen" }); i++;
+    } else {
+      throw new Error("不正な文字: " + expr[i]);
+    }
+  }
+  return tokens;
+}
+function parseExpr(tokens, pos) {
+  let [left, p] = parseTerm(tokens, pos);
+  while (p < tokens.length && tokens[p].type === "op" && (tokens[p].value === "+" || tokens[p].value === "-")) {
+    const op = tokens[p].value; p++;
+    let [right, np] = parseTerm(tokens, p); left = op === "+" ? left + right : left - right; p = np;
+  }
+  return [left, p];
+}
+function parseTerm(tokens, pos) {
+  let [left, p] = parseFactor(tokens, pos);
+  while (p < tokens.length && tokens[p].type === "op" && (tokens[p].value === "*" || tokens[p].value === "/")) {
+    const op = tokens[p].value; p++;
+    let [right, np] = parseFactor(tokens, p); left = op === "*" ? left * right : left / right; p = np;
+  }
+  return [left, p];
+}
+function parseFactor(tokens, pos) {
+  if (pos >= tokens.length) throw new Error("式が不完全です");
+  if (tokens[pos].type === "op" && tokens[pos].value === "-") {
+    let [val, p] = parseFactor(tokens, pos + 1); return [-val, p];
+  }
+  if (tokens[pos].type === "num") return [tokens[pos].value, pos + 1];
+  if (tokens[pos].type === "lparen") {
+    let [val, p] = parseExpr(tokens, pos + 1);
+    if (p >= tokens.length || tokens[p].type !== "rparen") throw new Error("カッコが閉じていません");
+    return [val, p + 1];
+  }
+  throw new Error("不正な式です");
+}
+function evaluate(expr) {
+  if (!expr.trim()) throw new Error("式が空です");
+  const tokens = tokenize(expr);
+  const [result, pos] = parseExpr(tokens, 0);
+  if (pos !== tokens.length) throw new Error("不正な式です");
+  return result;
+}
+function formatNumber(n) {
+  if (Number.isNaN(n) || !Number.isFinite(n)) return "エラー";
+  const fixed = Math.abs(n) < 1e-10 ? 0 : n;
+  return new Intl.NumberFormat("ja-JP", { maximumFractionDigits: 4 }).format(fixed);
+}
+function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
+
+// ─── IndexedDB helpers ───
+const DB_NAME = "re-calc-db";
+const DB_VERSION = 2;
+const CASE_STORE = "cases";
+const FILE_STORE = "files";
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(CASE_STORE)) {
+        db.createObjectStore(CASE_STORE, { keyPath: "id" });
+      }
+      if (!db.objectStoreNames.contains(FILE_STORE)) {
+        db.createObjectStore(FILE_STORE, { keyPath: "id" });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbGetAll(storeName) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, "readonly");
+    const req = tx.objectStore(storeName).getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbGet(storeName, id) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, "readonly");
+    const req = tx.objectStore(storeName).get(id);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbPut(storeName, item) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, "readwrite");
+    tx.objectStore(storeName).put(item);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function idbDelete(storeName, id) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, "readwrite");
+    tx.objectStore(storeName).delete(id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// Load file data on demand (lazy)
+async function loadFileData(fileId) {
+  try {
+    const record = await idbGet(FILE_STORE, fileId);
+    return record ? record.dataUrl : null;
+  } catch { return null; }
+}
+
+// Save file data separately
+async function saveFileData(fileId, dataUrl) {
+  try { await idbPut(FILE_STORE, { id: fileId, dataUrl }); } catch (e) { console.error("File save error:", e); }
+}
+
+// Delete file data
+async function deleteFileData(fileId) {
+  try { await idbDelete(FILE_STORE, fileId); } catch (e) { console.error("File delete error:", e); }
+}
+
+async function loadAllCases() {
+  try {
+    const cases = await idbGetAll(CASE_STORE);
+    if (cases.length > 0) {
+      // Migrate: if any file still has dataUrl inline, move to FILE_STORE
+      let migrated = false;
+      for (const c of cases) {
+        if (c.files) {
+          for (const f of c.files) {
+            if (f.dataUrl) {
+              await saveFileData(f.id, f.dataUrl);
+              delete f.dataUrl;
+              migrated = true;
+            }
+          }
+        }
+      }
+      if (migrated) { for (const c of cases) await idbPut(CASE_STORE, c); }
+      return cases;
+    }
+    // Migrate from localStorage
+    try {
+      const idx = JSON.parse(localStorage.getItem("re-calc-index") || "[]");
+      if (idx.length > 0) {
+        const lsCases = idx.map(meta => {
+          const full = JSON.parse(localStorage.getItem("re-calc-case:" + meta.id) || "null");
+          return full ? { ...meta, ...full } : { ...meta, memo: "", entries: [], files: [] };
+        });
+        for (const c of lsCases) {
+          if (c.files) {
+            for (const f of c.files) {
+              if (f.dataUrl) {
+                await saveFileData(f.id, f.dataUrl);
+                delete f.dataUrl;
+              }
+            }
+          }
+          await idbPut(CASE_STORE, c);
+        }
+        return lsCases;
+      }
+    } catch {}
+    return [];
+  } catch { return []; }
+}
+
+async function saveCaseData(c) {
+  try {
+    // Strip dataUrl from files before saving case (should already be stripped, but just in case)
+    const cleaned = { ...c, files: (c.files || []).map(f => { const { dataUrl, ...meta } = f; return meta; }) };
+    await idbPut(CASE_STORE, cleaned);
+  } catch (e) { console.error("Save error:", e); }
+}
+
+async function deleteCaseData(id) {
+  try { await idbDelete(CASE_STORE, id); } catch (e) { console.error("Delete error:", e); }
+}
+
+// Backup: include file data
+async function exportBackup(cases) {
+  const full = [];
+  for (const c of cases) {
+    const filesWithData = [];
+    for (const f of (c.files || [])) {
+      const dataUrl = await loadFileData(f.id);
+      filesWithData.push({ ...f, dataUrl: dataUrl || "" });
+    }
+    full.push({ ...c, files: filesWithData });
+  }
+  const data = JSON.stringify(full, null, 2);
+  const blob = new Blob([data], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "不動産収支計算機_backup_" + new Date().toISOString().slice(0, 10) + ".json";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// Restore: split file data back out
+function importBackup(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      try {
+        const cases = JSON.parse(e.target.result);
+        if (!Array.isArray(cases)) throw new Error("不正なデータ");
+        for (const c of cases) {
+          if (c.files) {
+            for (const f of c.files) {
+              if (f.dataUrl) {
+                await saveFileData(f.id, f.dataUrl);
+                delete f.dataUrl;
+              }
+            }
+          }
+          await idbPut(CASE_STORE, c);
+        }
+        resolve(cases);
+      } catch (err) { reject(err); }
+    };
+    reader.onerror = () => reject(reader.error);
+    reader.readAsText(file);
+  });
+}
+
+// ─── Colors ───
+const C = {
+  bg: "#F5F6F8", surface: "#FFFFFF", surface2: "#F0F1F4",
+  border: "#D9DCE3", border2: "#C5C9D3",
+  accent: "#2563EB", accent2: "#1D4FD7", accentSoft: "rgba(37,99,235,0.08)",
+  green: "#16A34A", greenSoft: "rgba(22,163,74,0.08)",
+  red: "#DC2626", redSoft: "rgba(220,38,38,0.08)",
+  amber: "#D97706", amberSoft: "rgba(217,119,6,0.08)",
+  text: "#1A1A1A", text2: "#6B7280", text3: "#9CA3AF",
+  white: "#FFFFFF", gray: "#6B7280", grayBg: "#6B7280",
+};
+const font = "'DM Sans', 'Noto Sans JP', sans-serif";
+
+function useIsMobile(bp = 640) {
+  const [m, setM] = useState(window.innerWidth < bp);
+  useEffect(() => { const f = () => setM(window.innerWidth < bp); window.addEventListener("resize", f); return () => window.removeEventListener("resize", f); }, []);
+  return m;
+}
+
+// Touch drag for mobile: long press handle → slide → release to place
+function useTouchDrag(onReorder) {
+  const [pickedIdx, setPickedIdx] = useState(null);
+  const [overIdx, setOverIdx] = useState(null);
+  const itemRefs = useRef([]);
+  const longPressTimer = useRef(null);
+  const active = useRef(false);
+
+  const setRef = (i, el) => { itemRefs.current[i] = el; };
+
+  const onTouchStart = (i, e) => {
+    longPressTimer.current = setTimeout(() => {
+      active.current = true;
+      setPickedIdx(i);
+      setOverIdx(i);
+      document.body.style.overflow = "hidden";
+      // Haptic feedback if available
+      if (navigator.vibrate) navigator.vibrate(30);
+    }, 300);
+  };
+
+  const onTouchMove = (e) => {
+    if (!active.current) {
+      // If finger moves before long press triggers, cancel
+      clearTimeout(longPressTimer.current);
+      return;
+    }
+    e.preventDefault();
+    const y = e.touches[0].clientY;
+    let found = null;
+    itemRefs.current.forEach((el, i) => {
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      if (y >= r.top && y <= r.bottom) found = i;
+    });
+    if (found !== null) setOverIdx(found);
+  };
+
+  const onTouchEnd = () => {
+    clearTimeout(longPressTimer.current);
+    if (active.current && pickedIdx !== null && overIdx !== null && pickedIdx !== overIdx) {
+      onReorder(pickedIdx, overIdx);
+    }
+    active.current = false;
+    setPickedIdx(null);
+    setOverIdx(null);
+    document.body.style.overflow = "";
+  };
+
+  return { pickedIdx, overIdx, setRef, onTouchStart, onTouchMove, onTouchEnd };
+}
+
+// ─── Main App ───
+function App() {
+  const [cases, setCases] = useState([]);
+  const [activeId, setActiveId] = useState(null);
+  const [loaded, setLoaded] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const isMobile = useIsMobile();
+  const [deleteConfirmId, setDeleteConfirmId] = useState(null);
+  const [sortMode, setSortMode] = useState("updated");
+
+  const selectCase = (id) => { setActiveId(id); if (isMobile) setSidebarOpen(false); };
+
+  useEffect(() => {
+    (async () => {
+      const d = await loadAllCases();
+      setCases(d);
+      if (d.length > 0) setActiveId(d[0].id);
+      setLoaded(true);
+    })();
+  }, []);
+
+  const prevCasesRef = useRef([]);
+  useEffect(() => {
+    if (!loaded) return;
+    const prevMap = new Map(prevCasesRef.current.map(c => [c.id, c]));
+    for (const c of cases) {
+      const prev = prevMap.get(c.id);
+      if (!prev || prev.name !== c.name || prev.memo !== c.memo || prev.entries !== c.entries || prev.files !== c.files || prev.updatedAt !== c.updatedAt) {
+        saveCaseData(c);
+      }
+    }
+    for (const prev of prevCasesRef.current) {
+      if (!cases.find(c => c.id === prev.id)) deleteCaseData(prev.id);
+    }
+    prevCasesRef.current = cases;
+  }, [cases, loaded]);
+
+  const activeCase = cases.find(c => c.id === activeId) || null;
+
+  const addCase = () => {
+    const now = Date.now();
+    const newC = { id: uid(), name: "新規案件", memo: "", entries: [], files: [], createdAt: now, updatedAt: now };
+    setCases(prev => [newC, ...prev]); setActiveId(newC.id); setSortMode("updated");
+    if (isMobile) setSidebarOpen(false);
+  };
+  const updateCase = (id, patch) => {
+    setCases(prev => prev.map(c => c.id === id ? { ...c, ...patch, updatedAt: Date.now() } : c));
+  };
+  const sortedCases = sortMode === "updated"
+    ? [...cases].sort((a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt))
+    : cases;
+
+  // Drag sort for cases (PC)
+  const [caseDragIdx, setCaseDragIdx] = useState(null);
+  const [caseDragOverIdx, setCaseDragOverIdx] = useState(null);
+  const handleCaseDragStart = (i) => { setCaseDragIdx(i); };
+  const handleCaseDragOver = (e, i) => { e.preventDefault(); setCaseDragOverIdx(i); };
+  const handleCaseDragEnd = () => {
+    if (caseDragIdx !== null && caseDragOverIdx !== null && caseDragIdx !== caseDragOverIdx) {
+      const reordered = [...sortedCases];
+      const [moved] = reordered.splice(caseDragIdx, 1);
+      reordered.splice(caseDragOverIdx, 0, moved);
+      setCases(reordered); setSortMode("manual");
+    }
+    setCaseDragIdx(null); setCaseDragOverIdx(null);
+  };
+  // Touch drag for cases (mobile)
+  const caseTouchDrag = useTouchDrag((from, to) => {
+    const reordered = [...sortedCases];
+    const [moved] = reordered.splice(from, 1);
+    reordered.splice(to, 0, moved);
+    setCases(reordered); setSortMode("manual");
+  });
+
+  const requestDelete = (id) => { setDeleteConfirmId(id); };
+  const confirmDelete = async () => {
+    const id = deleteConfirmId;
+    const target = cases.find(c => c.id === id);
+    if (target && target.files) {
+      for (const f of target.files) await deleteFileData(f.id);
+    }
+    setCases(prev => prev.filter(c => c.id !== id));
+    if (activeId === id) setActiveId(cases.find(c => c.id !== id)?.id || null);
+    setDeleteConfirmId(null);
+  };
+  const cancelDelete = () => { setDeleteConfirmId(null); };
+  const duplicateCase = async (c) => {
+    const now = Date.now();
+    const newFiles = [];
+    for (const f of (c.files || [])) {
+      const newId = uid();
+      const dataUrl = await loadFileData(f.id);
+      if (dataUrl) await saveFileData(newId, dataUrl);
+      newFiles.push({ ...f, id: newId });
+    }
+    const dup = { ...c, id: uid(), name: c.name + "（コピー）", createdAt: now, updatedAt: now, files: newFiles };
+    setCases(prev => [dup, ...prev]); setActiveId(dup.id);
+  };
+
+  if (!loaded) return React.createElement("div", { style: { background: C.bg, color: C.text, height: "100vh", display: "flex", alignItems: "center", justifyContent: "center" } }, "読み込み中...");
+
+  const topBtnStyle = { background: "none", border: "1px solid " + C.border, borderRadius: 6, color: C.text2, padding: "6px 10px", cursor: "pointer", fontSize: 14, flexShrink: 0 };
+
+  return (
+    <div style={{ fontFamily: font, background: C.bg, color: C.text, height: "100vh", display: "flex", overflow: "hidden" }}>
+      {isMobile && sidebarOpen && <div onClick={() => setSidebarOpen(false)} style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.3)", zIndex: 99 }} />}
+      {/* Sidebar */}
+      <div style={{
+        ...(isMobile ? { position: "fixed", top: 0, left: 0, bottom: 0, zIndex: 100, width: sidebarOpen ? "85vw" : 0, maxWidth: 320, boxShadow: sidebarOpen ? "4px 0 20px rgba(0,0,0,0.1)" : "none" }
+          : { width: sidebarOpen ? 280 : 0, minWidth: sidebarOpen ? 280 : 0 }),
+        background: C.surface, borderRight: "1px solid " + C.border, display: "flex", flexDirection: "column", transition: "all 0.25s ease", overflow: "hidden",
+      }}>
+        <div style={{ padding: "20px 16px 12px", borderBottom: "1px solid " + C.border }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: C.accent, letterSpacing: 1.5, marginBottom: 4 }}>不動産</div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: C.text }}>収支計算機</div>
+        </div>
+        <div style={{ padding: "12px 12px 8px" }}>
+          <button onClick={addCase} style={{ width: "100%", padding: "10px 0", background: C.accent, color: C.white, border: "none", borderRadius: 8, fontWeight: 600, fontSize: 14, cursor: "pointer", fontFamily: font }}>＋ 新規案件</button>
+        </div>
+        <div style={{ flex: 1, overflowY: "auto", padding: "4px 8px" }}>
+          {sortedCases.map((c, i) => (
+            <div key={c.id} ref={(el) => caseTouchDrag.setRef(i, el)}
+              draggable={!isMobile}
+              onDragStart={() => handleCaseDragStart(i)} onDragOver={(e) => handleCaseDragOver(e, i)} onDragEnd={handleCaseDragEnd}
+              onTouchStart={(e) => caseTouchDrag.onTouchStart(i, e)} onTouchMove={caseTouchDrag.onTouchMove} onTouchEnd={caseTouchDrag.onTouchEnd}
+              onClick={() => { if (caseTouchDrag.pickedIdx === null) selectCase(c.id); }}
+              style={{ padding: "12px 12px", marginBottom: 4, borderRadius: 8, background: (caseDragIdx === i || caseTouchDrag.pickedIdx === i) ? "#DBEAFE" : c.id === activeId ? C.accentSoft : "transparent", borderLeft: c.id === activeId ? "3px solid " + C.accent : "3px solid transparent", borderTop: (caseDragOverIdx === i && caseDragIdx !== i) || (caseTouchDrag.overIdx === i && caseTouchDrag.pickedIdx !== null && caseTouchDrag.pickedIdx !== i) ? "3px solid " + C.accent : "none", opacity: (caseDragIdx === i || caseTouchDrag.pickedIdx === i) ? 0.4 : 1, cursor: isMobile ? "pointer" : "grab", transition: "all 0.1s", display: "flex", alignItems: "center", gap: 8, userSelect: "none" }}>
+              <span style={{ color: C.text3, fontSize: 16, flexShrink: 0, userSelect: "none" }}>⠿</span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 14, fontWeight: 600, color: c.id === activeId ? C.accent : C.text, marginBottom: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.name}</div>
+                <div style={{ fontSize: 11, color: C.text3 }}>{c.entries.length}件の計算 · {c.files.length}件の添付</div>
+              </div>
+            </div>
+          ))}
+          {cases.length === 0 && <div style={{ padding: 20, textAlign: "center", color: C.text3, fontSize: 13 }}>案件がありません<br />「＋ 新規案件」から作成</div>}
+        </div>
+        {/* Backup / Restore */}
+        <div style={{ padding: "8px 12px 12px", borderTop: "1px solid " + C.border, display: "flex", gap: 6 }}>
+          <button onClick={() => exportBackup(cases)} style={{ flex: 1, padding: "8px 0", background: C.surface2, color: C.text2, border: "1px solid " + C.border, borderRadius: 6, fontSize: 11, cursor: "pointer", fontFamily: font, fontWeight: 500 }}>バックアップ保存</button>
+          <label style={{ flex: 1, padding: "8px 0", background: C.surface2, color: C.text2, border: "1px solid " + C.border, borderRadius: 6, fontSize: 11, cursor: "pointer", fontFamily: font, fontWeight: 500, textAlign: "center" }}>
+            バックアップ復元
+            <input type="file" accept=".json" style={{ display: "none" }} onChange={async (e) => {
+              const file = e.target.files[0]; if (!file) return;
+              try {
+                const restored = await importBackup(file);
+                setCases(restored);
+                if (restored.length > 0) setActiveId(restored[0].id);
+                alert("復元しました（" + restored.length + "件）");
+              } catch (err) { alert("復元に失敗しました: " + err.message); }
+              e.target.value = "";
+            }} />
+          </label>
+        </div>
+      </div>
+
+      {/* Main */}
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        <div style={{ padding: isMobile ? "10px 12px" : "12px 20px", borderBottom: "1px solid " + C.border, display: "flex", alignItems: "center", gap: isMobile ? 6 : 12, background: C.surface }}>
+          <button onClick={() => setSidebarOpen(!sidebarOpen)} style={{ background: "none", border: "1px solid " + C.border, borderRadius: 6, color: C.text2, padding: "6px 10px", cursor: "pointer", fontSize: 16, flexShrink: 0 }}>☰</button>
+          {activeCase && (<>
+            <input value={activeCase.name} onChange={e => updateCase(activeCase.id, { name: e.target.value })} style={{ flex: 1, background: "transparent", border: "none", color: C.text, fontSize: isMobile ? 14 : 18, fontWeight: 700, fontFamily: font, outline: "none", minWidth: 0 }} placeholder="案件名" />
+            <button onClick={() => duplicateCase(activeCase)} style={{ ...topBtnStyle, color: C.gray, fontSize: isMobile ? 11 : 13, display: "flex", alignItems: "center", gap: 3, padding: isMobile ? "5px 7px" : "6px 10px", flexShrink: 0, whiteSpace: "nowrap" }}>⧉ 複製</button>
+            <button onClick={() => requestDelete(activeCase.id)} style={{ ...topBtnStyle, background: "#DC2626", color: C.white, fontSize: isMobile ? 12 : 13, padding: isMobile ? "5px 10px" : "8px 14px", borderColor: "transparent", flexShrink: 0, whiteSpace: "nowrap", fontWeight: 600 }}>削除</button>
+          </>)}
+        </div>
+        <div style={{ flex: 1, overflowY: "auto", padding: isMobile ? "12px 12px 32px" : "20px 24px 40px" }}>
+          {activeCase ? <CaseDetail c={activeCase} update={(patch) => updateCase(activeCase.id, patch)} onDelete={() => requestDelete(activeCase.id)} isMobile={isMobile} />
+            : <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", color: C.text3 }}>
+                <div style={{ fontSize: 48, marginBottom: 16, opacity: 0.3 }}>🏢</div>
+                <div style={{ fontSize: 16 }}>{isMobile ? "☰ メニューから案件を選択・作成" : "左メニューから案件を選択、または新規作成してください"}</div>
+              </div>}
+        </div>
+      </div>
+
+      {/* Delete dialog */}
+      {deleteConfirmId && (
+        <div style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }} onClick={cancelDelete}>
+          <div style={{ background: C.surface, border: "1px solid " + C.border, borderRadius: 14, padding: "28px 32px", maxWidth: 360, width: "90%", textAlign: "center" }} onClick={e => e.stopPropagation()}>
+            <div style={{ fontSize: 16, fontWeight: 700, color: C.text, marginBottom: 8 }}>案件を削除しますか？</div>
+            <div style={{ fontSize: 13, color: C.text2, marginBottom: 24 }}>この操作は取り消せません。</div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button onClick={cancelDelete} style={{ flex: 1, padding: "10px 0", background: C.surface2, color: C.text, border: "1px solid " + C.border, borderRadius: 8, fontWeight: 600, fontSize: 14, cursor: "pointer" }}>キャンセル</button>
+              <button onClick={confirmDelete} style={{ flex: 1, padding: "10px 0", background: C.red, color: C.white, border: "none", borderRadius: 8, fontWeight: 600, fontSize: 14, cursor: "pointer" }}>削除する</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── FileThumb (lazy-loads image from IndexedDB) ───
+function FileThumb({ f, onRemove }) {
+  const [thumbUrl, setThumbUrl] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (f.type && f.type.startsWith("image/")) {
+      setLoading(true);
+      loadFileData(f.id).then(url => { setThumbUrl(url); setLoading(false); });
+    }
+  }, [f.id, f.type]);
+
+  return (
+    <div style={{ background: C.surface2, border: "1px solid " + C.border, borderRadius: 8, padding: "8px 12px", display: "flex", alignItems: "center", gap: 8, maxWidth: 260 }}>
+      {f.type && f.type.startsWith("image/")
+        ? (thumbUrl ? <img src={thumbUrl} alt={f.name} style={{ width: 36, height: 36, objectFit: "cover", borderRadius: 4 }} />
+          : <div style={{ width: 36, height: 36, borderRadius: 4, background: C.surface2, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: C.text3 }}>{loading ? "..." : "?"}</div>)
+        : <div style={{ width: 36, height: 36, borderRadius: 4, background: C.accentSoft, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>{f.type && f.type.includes("pdf") ? "📄" : "📁"}</div>}
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 12, fontWeight: 500, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</div>
+        <div style={{ fontSize: 10, color: C.text3 }}>{(f.size / 1024).toFixed(0)} KB</div>
+      </div>
+      <button onClick={onRemove} style={{ background: "none", border: "none", color: C.text3, cursor: "pointer", fontSize: 12 }}>✕</button>
+    </div>
+  );
+}
+
+// ─── CaseDetail ───
+function CaseDetail({ c, update, onDelete, isMobile }) {
+  const [expr, setExpr] = useState("");
+  const [memo, setMemo] = useState("");
+  const [error, setError] = useState("");
+  const inputRef = useRef(null);
+
+  // Drag sort for entries (PC)
+  const [dragIdx, setDragIdx] = useState(null);
+  const [dragOverIdx, setDragOverIdx] = useState(null);
+  const handleDragStart = (i) => { setDragIdx(i); };
+  const handleDragOver = (e, i) => { e.preventDefault(); setDragOverIdx(i); };
+  const handleDragEnd = () => {
+    if (dragIdx !== null && dragOverIdx !== null && dragIdx !== dragOverIdx) {
+      const ne = [...c.entries]; const [moved] = ne.splice(dragIdx, 1); ne.splice(dragOverIdx, 0, moved); update({ entries: ne });
+    }
+    setDragIdx(null); setDragOverIdx(null);
+  };
+  // Touch drag for entries (mobile)
+  const entryTouchDrag = useTouchDrag((from, to) => {
+    const ne = [...c.entries]; const [moved] = ne.splice(from, 1); ne.splice(to, 0, moved); update({ entries: ne });
+  });
+
+  const addEntry = () => {
+    try {
+      const result = evaluate(expr);
+      update({ entries: [...c.entries, { id: uid(), type: "calc", expr, memo, result }] });
+      setExpr(""); setMemo(""); setError("");
+    } catch (e) { setError(e.message); }
+    inputRef.current?.focus();
+  };
+
+  const removeEntry = (eid) => { update({ entries: c.entries.filter(e => e.id !== eid) }); };
+  const updateEntryMemo = (eid, v) => { update({ entries: c.entries.map(e => e.id === eid ? { ...e, memo: v } : e) }); };
+  const updateEntryExpr = (eid, v) => {
+    let r; try { r = evaluate(v); } catch { r = null; }
+    update({ entries: c.entries.map(e => e.id === eid ? { ...e, expr: v, result: r !== null ? r : e.result } : e) });
+  };
+
+  const addFile = (e) => {
+    const fl = e.target.files; if (!fl) return;
+    Array.from(fl).forEach(file => {
+      const reader = new FileReader();
+      reader.onload = async (ev) => {
+        const fileId = uid();
+        await saveFileData(fileId, ev.target.result);
+        update({ files: [...c.files, { id: fileId, name: file.name, type: file.type, size: file.size }] });
+      };
+      reader.readAsDataURL(file);
+    });
+    e.target.value = "";
+  };
+  const removeFile = async (fid) => {
+    await deleteFileData(fid);
+    update({ files: c.files.filter(f => f.id !== fid) });
+  };
+
+  const preview = (() => {
+    if (!expr.trim()) return null;
+    try { return { ok: true, value: evaluate(expr) }; } catch (e) { return { ok: false, message: e.message }; }
+  })();
+
+  const handleKeyDown = (e) => { if (e.key === "Enter" && expr.trim() && preview?.ok) { e.preventDefault(); addEntry(); } };
+
+  return (
+    <div style={{ maxWidth: 860, margin: "0 auto" }}>
+      <div style={{ marginBottom: 24 }}>
+        <textarea value={c.memo} onChange={e => update({ memo: e.target.value })} placeholder="案件メモ（所在地、物件概要など自由に記入）" rows={2}
+          style={{ width: "100%", background: C.surface, border: "1px solid " + C.border, borderRadius: 8, padding: "10px 14px", color: C.text, fontSize: 13, fontFamily: font, resize: "vertical", outline: "none", boxSizing: "border-box" }} />
+      </div>
+
+      <div style={{ background: C.surface, border: "1px solid " + C.border, borderRadius: 12, padding: 16, marginBottom: 20 }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 8 }}>
+          <input ref={inputRef} value={memo} onChange={e => setMemo(e.target.value)} placeholder="メモ（例：家賃収入）"
+            style={{ width: "100%", background: C.surface2, border: "1px solid " + C.border, borderRadius: 6, padding: "8px 12px", color: C.text, fontSize: 13, fontFamily: font, outline: "none", boxSizing: "border-box" }} />
+          <div style={{ display: "flex", gap: 8 }}>
+            <input value={expr} onChange={e => { setExpr(e.target.value); setError(""); }} onKeyDown={handleKeyDown} placeholder="計算式を入力（例：1500000 * 12）"
+              style={{ flex: 1, background: C.surface2, border: "1px solid " + (error ? C.red : C.border), borderRadius: 6, padding: "8px 14px", color: C.text, fontSize: 15, fontFamily: "'JetBrains Mono', monospace", outline: "none", boxSizing: "border-box" }} />
+            <button onClick={addEntry} disabled={!expr.trim()} style={{ background: C.accent, color: C.white, border: "none", borderRadius: 6, padding: "8px 18px", fontWeight: 600, fontSize: 14, cursor: expr.trim() ? "pointer" : "default", opacity: expr.trim() ? 1 : 0.4, whiteSpace: "nowrap" }}>＋ 追加</button>
+          </div>
+        </div>
+        {expr.trim() && (
+          <div style={{ marginTop: 8, padding: "10px 16px", background: preview?.ok ? C.surface2 : C.redSoft, borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: C.text3 }}>{expr}</span>
+            {preview?.ok
+              ? <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 20, fontWeight: 700, color: preview.value >= 0 ? C.green : C.red }}>= {preview.value < 0 ? "△ " : ""}{formatNumber(Math.abs(preview.value))}</span>
+              : <span style={{ fontSize: 12, color: C.red }}>{preview?.message}</span>}
+          </div>
+        )}
+        {error && <div style={{ color: C.red, fontSize: 12, marginTop: 4 }}>{error}</div>}
+      </div>
+
+      {c.entries.length > 0 && (
+        <div style={{ background: C.surface, border: "1px solid " + C.border, borderRadius: 12, overflow: "hidden", marginBottom: 24 }}>
+          {c.entries.map((e, i) => {
+            return (
+              <div key={e.id} ref={(el) => entryTouchDrag.setRef(i, el)}
+                draggable={!isMobile}
+                onDragStart={() => handleDragStart(i)} onDragOver={(ev) => handleDragOver(ev, i)} onDragEnd={handleDragEnd}
+                onTouchStart={(ev) => entryTouchDrag.onTouchStart(i, ev)} onTouchMove={entryTouchDrag.onTouchMove} onTouchEnd={entryTouchDrag.onTouchEnd}
+                style={{ padding: "12px 16px", borderBottom: i < c.entries.length - 1 ? "1px solid " + C.border : "none", borderTop: (dragOverIdx === i && dragIdx !== i) || (entryTouchDrag.overIdx === i && entryTouchDrag.pickedIdx !== null && entryTouchDrag.pickedIdx !== i) ? "3px solid " + C.accent : "none", background: (dragIdx === i || entryTouchDrag.pickedIdx === i) ? "#DBEAFE" : "transparent", opacity: (dragIdx === i || entryTouchDrag.pickedIdx === i) ? 0.4 : 1, cursor: isMobile ? "default" : "grab", display: "flex", gap: 10, alignItems: "stretch", userSelect: "none" }}>
+                <div style={{ display: "flex", alignItems: "center", color: C.text3, fontSize: 16, userSelect: "none", padding: "0 2px", flexShrink: 0 }}>⠿</div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+                    <input value={e.memo} onChange={ev => updateEntryMemo(e.id, ev.target.value)} style={{ background: "transparent", border: "none", color: C.text, fontSize: 13, fontWeight: 500, fontFamily: font, outline: "none", flex: 1 }} placeholder="メモなし" />
+                    <button onClick={() => removeEntry(e.id)} style={{ background: C.grayBg, border: "none", color: C.white, cursor: "pointer", fontSize: 11, fontWeight: 600, padding: "4px 10px", borderRadius: 6, flexShrink: 0 }}>削除</button>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12 }}>
+                    <input value={e.expr} onChange={ev => updateEntryExpr(e.id, ev.target.value)}
+                      style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: C.text2, background: "transparent", border: "none", borderBottom: "1px dashed " + C.border, outline: "none", flex: 1, minWidth: 0, padding: "2px 0" }} />
+                    <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 18, fontWeight: 700, flexShrink: 0, whiteSpace: "nowrap", color: e.result >= 0 ? C.green : C.red }}>
+                      = {e.result < 0 ? "△ " : ""}{formatNumber(Math.abs(e.result))}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* File attachments */}
+      <div style={{ background: C.surface, border: "1px solid " + C.border, borderRadius: 12, padding: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+          <div style={{ fontSize: 14, fontWeight: 600, color: C.text2 }}>📎 添付ファイル</div>
+          <label style={{ background: C.surface2, border: "1px solid " + C.border, borderRadius: 6, padding: "6px 14px", fontSize: 13, color: C.text, cursor: "pointer" }}>
+            ファイルを追加
+            <input type="file" multiple onChange={addFile} style={{ display: "none" }} />
+          </label>
+        </div>
+        {c.files.length === 0 && <div style={{ color: C.text3, fontSize: 13, textAlign: "center", padding: "16px 0" }}>添付ファイルはありません</div>}
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+          {c.files.map(f => (
+            <FileThumb key={f.id} f={f} onRemove={() => removeFile(f.id)} />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+<script>
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', function() {
+    navigator.serviceWorker.register('./sw.js').then(function(reg) {
+      console.log('SW registered:', reg.scope);
+    }).catch(function(err) {
+      console.log('SW registration failed:', err);
+    });
+  });
+}
+</script>
+</body>
+</html>
